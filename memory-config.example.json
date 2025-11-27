@@ -1,0 +1,9 @@
+{
+  "machineId": "my-macbook",
+  "firestore": {
+    "enabled": true,
+    "projectId": "your-firebase-project-id",
+    "keyFilePath": "/Users/YOUR_USERNAME/.claude/firestore-key.json",
+    "collectionPrefix": "claude-memory"
+  }
+}

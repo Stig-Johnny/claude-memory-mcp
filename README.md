@@ -11,39 +11,20 @@ A Model Context Protocol (MCP) server that provides persistent memory capabiliti
 - **Sessions**: Save and restore work session state
 - **Cloud Sync** (optional): Sync memory across machines using Google Cloud Firestore
 
-## Installation
-
-### Option 1: Clone and Install
+## Quick Start
 
 ```bash
-# Clone the repository
+# 1. Clone the repository
 git clone https://github.com/Stig-Johnny/claude-memory-mcp.git ~/.claude/mcp-servers/claude-memory
 
-# Install dependencies
+# 2. Install dependencies
 cd ~/.claude/mcp-servers/claude-memory
 npm install
+
+# 3. Add to Claude Code settings (~/.claude/settings.json)
 ```
 
-### Option 2: Manual Setup
-
-```bash
-# Create the directory
-mkdir -p ~/.claude/mcp-servers/claude-memory
-cd ~/.claude/mcp-servers/claude-memory
-
-# Copy the files (index.js, package.json)
-npm install
-```
-
-### With Firestore Cloud Sync (Optional)
-
-```bash
-npm install @google-cloud/firestore
-```
-
-## Configuration
-
-Add to your Claude Code MCP settings (`~/.claude/settings.json`):
+Add this to your `~/.claude/settings.json`:
 
 ```json
 {
@@ -56,63 +37,104 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json`):
 }
 ```
 
-Replace `YOUR_USERNAME` with your actual username.
+Replace `YOUR_USERNAME` with your actual username (run `whoami` to check).
+
+**4. Restart Claude Code** to load the MCP server.
 
 ## Database Location
 
 The SQLite database is stored at `~/.claude/memory.db`. This file persists across Claude Code sessions.
 
-## Cloud Sync with Firestore
+---
 
-To sync your memory across multiple machines, configure Firestore:
+## Cloud Sync with Firestore (Multi-Machine Setup)
 
-### 1. Create a Google Cloud Project
+To sync your memory across multiple machines (e.g., home and work computers), set up Firestore:
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select an existing one
-3. Enable the Firestore API
+### Step 1: Create Firebase Project
 
-### 2. Create a Service Account
+1. Go to [Firebase Console](https://console.firebase.google.com/)
+2. Click **"Create a project"**
+3. Name it (e.g., `claude-memory-mcp`)
+4. Disable Google Analytics (not needed)
+5. Click **Create**
 
-1. Go to IAM & Admin > Service Accounts
-2. Create a new service account with "Cloud Datastore User" role
-3. Create and download a JSON key file
-4. Save it somewhere secure (e.g., `~/.claude/firestore-key.json`)
+### Step 2: Create Firestore Database
 
-### 3. Configure the MCP Server
+1. In Firebase Console, go to **Build → Firestore Database**
+2. Click **"Create database"**
+3. Choose **"Start in test mode"** (we'll secure it later)
+4. Select a location:
+   - `eur3` (Europe) - if you're in Europe
+   - `nam5` (US) - if you're in the US
+5. Click **Create**
+
+### Step 3: Get Service Account Key
+
+1. Go to **Project Settings** (gear icon) → **Service accounts** tab
+2. Click **"Generate new private key"**
+3. Save the downloaded JSON file to `~/.claude/firestore-key.json`
+
+### Step 4: Create Config File
 
 Create `~/.claude/memory-config.json`:
 
 ```json
 {
-  "machineId": "macbook-pro",
+  "machineId": "my-macbook",
   "firestore": {
     "enabled": true,
-    "projectId": "your-gcp-project-id",
+    "projectId": "claude-memory-mcp",
     "keyFilePath": "/Users/YOUR_USERNAME/.claude/firestore-key.json",
     "collectionPrefix": "claude-memory"
   }
 }
 ```
 
-### 4. Sync Tools
+**Important:**
+- Replace `YOUR_USERNAME` with your actual username
+- Replace `claude-memory-mcp` with your Firebase project ID
+- Use a unique `machineId` for each computer (e.g., `macbook-home`, `macbook-work`)
 
-When Firestore is enabled, two additional tools become available:
-
-| Tool | Description |
-|------|-------------|
-| `sync_to_cloud` | Push all local memory to Firestore |
-| `pull_from_cloud` | Pull memory from Firestore for a project |
-
-### Alternative: Application Default Credentials
-
-If you have `gcloud` CLI configured, you can omit `keyFilePath` and use ADC:
+### Step 5: Install Firestore Package
 
 ```bash
-gcloud auth application-default login
+cd ~/.claude/mcp-servers/claude-memory
+npm install @google-cloud/firestore
 ```
 
-Then just set `enabled`, `projectId`, and `collectionPrefix` in the config.
+### Step 6: Restart Claude Code
+
+Quit and reopen Claude Code. You should see `(synced)` after memory operations.
+
+### Setting Up Additional Machines
+
+On each additional machine:
+
+1. Clone the repo:
+   ```bash
+   git clone https://github.com/Stig-Johnny/claude-memory-mcp.git ~/.claude/mcp-servers/claude-memory
+   cd ~/.claude/mcp-servers/claude-memory
+   npm install
+   npm install @google-cloud/firestore
+   ```
+
+2. Copy these files from your first machine:
+   - `~/.claude/firestore-key.json` (same key works on all machines)
+   - `~/.claude/memory-config.json` (change `machineId` to be unique!)
+
+3. Add MCP server to `~/.claude/settings.json` (same as Step 3 in Quick Start)
+
+4. Restart Claude Code
+
+### How Sync Works
+
+- **Automatic sync on write**: When you store a decision, error, or context, it saves locally AND syncs to Firestore
+- **Manual sync**: Use `sync_to_cloud` to push all local data, `pull_from_cloud` to fetch from cloud
+- **Local-first**: Local SQLite is the primary database; Firestore is for cross-machine sync
+- **Offline capable**: Works offline, syncs when connected
+
+---
 
 ## Available Tools
 
@@ -167,6 +189,8 @@ Then just set `enabled`, `projectId`, and `collectionPrefix` in the config.
 | `sync_to_cloud` | Push local memory to Firestore |
 | `pull_from_cloud` | Pull memory from Firestore |
 
+---
+
 ## Usage Examples
 
 ### Store a Decision
@@ -219,63 +243,7 @@ sync_to_cloud(project: "my-project")
 pull_from_cloud(project: "my-project")
 ```
 
-## Database Schema
-
-```sql
--- Decisions
-CREATE TABLE decisions (
-  id INTEGER PRIMARY KEY,
-  project TEXT NOT NULL,
-  date TEXT NOT NULL,
-  decision TEXT NOT NULL,
-  rationale TEXT,
-  created_at TEXT,
-  synced_at TEXT
-);
-
--- Errors
-CREATE TABLE errors (
-  id INTEGER PRIMARY KEY,
-  project TEXT NOT NULL,
-  error_pattern TEXT NOT NULL,
-  solution TEXT NOT NULL,
-  context TEXT,
-  created_at TEXT,
-  synced_at TEXT
-);
-
--- Context (key-value store)
-CREATE TABLE context (
-  id INTEGER PRIMARY KEY,
-  project TEXT NOT NULL,
-  key TEXT NOT NULL,
-  value TEXT NOT NULL,
-  updated_at TEXT,
-  synced_at TEXT,
-  UNIQUE(project, key)
-);
-
--- Learnings
-CREATE TABLE learnings (
-  id INTEGER PRIMARY KEY,
-  project TEXT,  -- NULL for global learnings
-  category TEXT NOT NULL,
-  content TEXT NOT NULL,
-  created_at TEXT,
-  synced_at TEXT
-);
-
--- Sessions
-CREATE TABLE sessions (
-  id INTEGER PRIMARY KEY,
-  project TEXT NOT NULL UNIQUE,
-  task TEXT NOT NULL,
-  status TEXT,
-  notes TEXT,
-  updated_at TEXT,
-  synced_at TEXT
-);
-```
+---
 
 ## Multi-Project Support
 
@@ -284,6 +252,8 @@ Memory is organized by project name. Use consistent project names across session
 - `"my-app"` - Main application
 - `"my-app-sdk"` - Related SDK
 - `null` (for learnings) - Global learnings shared across all projects
+
+---
 
 ## Backup and Migration
 
@@ -301,7 +271,7 @@ sqlite3 ~/.claude/memory.db
 SELECT * FROM decisions WHERE project = 'my-project';
 ```
 
-### Export to Firestore
+### Export All Local Data to Firestore
 
 If you have existing local data and want to migrate to cloud:
 
@@ -309,25 +279,46 @@ If you have existing local data and want to migrate to cloud:
 sync_to_cloud(project: "all")
 ```
 
+---
+
 ## Troubleshooting
 
-### Firestore Not Connecting
+### Firestore Not Syncing (no "(synced)" message)
 
-1. Check that `@google-cloud/firestore` is installed:
+1. **Restart Claude Code** after creating the config file
+2. Check config file exists and is valid:
    ```bash
+   cat ~/.claude/memory-config.json | python3 -m json.tool
+   ```
+3. Check Firestore package is installed:
+   ```bash
+   cd ~/.claude/mcp-servers/claude-memory
    npm list @google-cloud/firestore
    ```
 
-2. Verify your config file exists and is valid JSON:
-   ```bash
-   cat ~/.claude/memory-config.json | jq
-   ```
+### Permission Denied Error
 
-3. Check the MCP server logs for errors (visible in Claude Code console)
+Make sure your service account has the "Cloud Datastore User" role:
+1. Go to [GCP IAM Console](https://console.cloud.google.com/iam-admin/iam)
+2. Find your service account (ends with `@your-project.iam.gserviceaccount.com`)
+3. Add "Cloud Datastore User" role
 
-### Permission Denied
+### Key File Not Found
 
-Make sure your service account has the "Cloud Datastore User" role in IAM.
+Verify the path in `memory-config.json` matches where you saved the key:
+```bash
+ls -la ~/.claude/firestore-key.json
+```
+
+---
+
+## Security Notes
+
+- **Keep `firestore-key.json` private** - never commit it to Git
+- The service account key has access to your Firestore database
+- Firebase "test mode" rules expire after 30 days - [set up proper rules](https://firebase.google.com/docs/firestore/security/get-started) for production
+
+---
 
 ## License
 
