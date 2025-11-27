@@ -47,6 +47,182 @@ The SQLite database is stored at `~/.claude/memory.db`. This file persists acros
 
 ---
 
+## Integrating with Your Project's CLAUDE.md
+
+To get the most out of claude-memory, add instructions to your project's `CLAUDE.md` file so Claude knows when and how to use the memory tools.
+
+### Recommended CLAUDE.md Section
+
+Add this to your project's `CLAUDE.md`:
+
+```markdown
+## 🧠 Persistent Memory (MCP)
+
+This project uses the claude-memory MCP for cross-session context.
+
+### At Session Start
+
+Always recall context at the beginning of each session:
+
+mcp__claude-memory__get_session(project: "my-project")
+mcp__claude-memory__get_context(project: "my-project")
+mcp__claude-memory__recall_decisions(project: "my-project", limit: 5)
+
+### What to Store
+
+| Type | Tool | When to Use |
+|------|------|-------------|
+| Config/URLs/versions | `set_context` | SDK versions, API URLs, bundle IDs |
+| Architectural choices | `remember_decision` | Decisions with trade-offs worth documenting |
+| Bug solutions | `remember_error` | Non-trivial bugs you might encounter again |
+| Patterns/gotchas | `remember_learning` | Tips that save time |
+| Work state | `save_session` | Before ending a session mid-task |
+
+### Before Ending a Session (if work is incomplete)
+
+save_session(
+  project: "my-project",
+  task: "What you were working on",
+  status: "in-progress",
+  notes: "Next steps to resume..."
+)
+
+### When Task is Complete
+
+clear_session(project: "my-project")
+```
+
+### Example: Real-World CLAUDE.md Integration
+
+Here's a more complete example from a production project:
+
+```markdown
+## 🧠 Persistent Memory
+
+### At Session Start
+Always run these to load context:
+- `get_context(project: "my-app")` - Get SDK versions, URLs, config
+- `recall_decisions(project: "my-app", limit: 10)` - Recent architectural decisions
+- `get_session(project: "my-app")` - Check for unfinished work
+
+### What to Remember
+
+**Store context for:**
+- `sdk_version` - Current SDK version number
+- `api_url` - Production API endpoint
+- `bundle_id` - iOS/Android bundle identifier
+
+**Store decisions when:**
+- Choosing between technologies (e.g., "Use SQLite over CoreData")
+- Making trade-offs (e.g., "Polling vs WebSockets")
+- Establishing patterns (e.g., "All API calls go through ApiClient")
+
+**Store errors when:**
+- The fix wasn't obvious
+- You might encounter it again
+- It took significant debugging time
+```
+
+---
+
+## Best Practices
+
+### Project Naming
+
+Use consistent, short project names:
+- ✅ `"my-app"` - short and clear
+- ✅ `"my-app-ios"` - for related sub-projects
+- ❌ `"My Application Project"` - too long
+
+### Context Keys Convention
+
+Use snake_case for context keys:
+- `sdk_version`
+- `api_url`
+- `bundle_id`
+- `production_api_key`
+
+### What to Store vs. What NOT to Store
+
+**DO store:**
+- SDK versions, API URLs, bundle IDs
+- Architectural decisions with rationale
+- Non-obvious bug fixes
+- Project-specific gotchas and patterns
+
+**DON'T store:**
+- Temporary debugging info
+- Obvious/trivial fixes
+- Secrets or credentials (use environment variables instead!)
+- Information that changes every session
+
+---
+
+## Workflow Examples
+
+### Starting a New Session
+
+```
+get_session(project: "my-app")              # Check for unfinished work
+get_context(project: "my-app")              # Load project config
+recall_decisions(project: "my-app", limit: 5)  # Recent decisions
+```
+
+### After Fixing a Tricky Bug
+
+```
+remember_error(
+  project: "my-app",
+  error_pattern: "SQLITE_CONSTRAINT: UNIQUE constraint failed",
+  solution: "Use INSERT OR REPLACE instead of INSERT for upserts",
+  context: "When upserting records in SQLite/D1"
+)
+```
+
+### After Making an Architectural Decision
+
+```
+remember_decision(
+  project: "my-app",
+  decision: "Use polling instead of WebSockets for real-time updates",
+  rationale: "WebSockets add complexity; our updates are infrequent (30s interval is acceptable)"
+)
+```
+
+### Storing Project Configuration
+
+```
+set_context(project: "my-app", key: "sdk_version", value: "2.1.0")
+set_context(project: "my-app", key: "api_url", value: "https://api.my-app.com")
+set_context(project: "my-app", key: "min_ios_version", value: "15.0")
+```
+
+### Before Ending a Session Mid-Task
+
+```
+save_session(
+  project: "my-app",
+  task: "Implementing user authentication",
+  status: "in-progress",
+  notes: "JWT generation done. Still need: refresh tokens, logout endpoint, token expiry handling"
+)
+```
+
+### When Task is Complete
+
+```
+clear_session(project: "my-app")
+```
+
+### Searching for Past Solutions
+
+```
+find_solution(project: "my-app", error: "UNIQUE constraint")
+search_all(project: "my-app", query: "authentication")
+```
+
+---
+
 ## Cloud Sync with Firestore (Multi-Machine Setup)
 
 To sync your memory across multiple machines (e.g., home and work computers), set up Firestore:
@@ -191,60 +367,6 @@ On each additional machine:
 
 ---
 
-## Usage Examples
-
-### Store a Decision
-
-```
-remember_decision(
-  project: "my-project",
-  decision: "Use PostgreSQL instead of MongoDB",
-  rationale: "Better support for complex queries and transactions"
-)
-```
-
-### Store an Error Solution
-
-```
-remember_error(
-  project: "my-project",
-  error_pattern: "ECONNREFUSED 127.0.0.1:5432",
-  solution: "Start PostgreSQL service: brew services start postgresql",
-  context: "Database connection on macOS"
-)
-```
-
-### Save Session State
-
-```
-save_session(
-  project: "my-project",
-  task: "Implementing user authentication",
-  status: "in-progress",
-  notes: "JWT token generation done, need to add refresh tokens"
-)
-```
-
-### At Session Start
-
-```
-get_session(project: "my-project")
-get_context(project: "my-project")
-recall_decisions(project: "my-project", limit: 5)
-```
-
-### Sync Across Machines
-
-```
-# On Machine A (after making changes)
-sync_to_cloud(project: "my-project")
-
-# On Machine B (to get those changes)
-pull_from_cloud(project: "my-project")
-```
-
----
-
 ## Multi-Project Support
 
 Memory is organized by project name. Use consistent project names across sessions:
@@ -317,9 +439,16 @@ ls -la ~/.claude/firestore-key.json
 - **Keep `firestore-key.json` private** - never commit it to Git
 - The service account key has access to your Firestore database
 - Firebase "test mode" rules expire after 30 days - [set up proper rules](https://firebase.google.com/docs/firestore/security/get-started) for production
+- **Never store secrets** (API keys, passwords) in memory - use environment variables
+
+---
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
 
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details.
