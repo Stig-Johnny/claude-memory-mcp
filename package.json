@@ -1,14 +1,26 @@
 {
-  "name": "claude-memory",
-  "version": "1.2.0",
-  "description": "MCP server for Claude Code persistent memory",
+  "name": "claude-memory-mcp",
+  "version": "2.0.0",
+  "description": "MCP server for Claude Code persistent memory with optional Firestore cloud sync",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "keywords": [
+    "claude",
+    "mcp",
+    "memory",
+    "claude-code",
+    "firestore"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^0.5.0",
     "better-sqlite3": "^11.0.0"
+  },
+  "optionalDependencies": {
+    "@google-cloud/firestore": "^7.0.0"
   }
 }

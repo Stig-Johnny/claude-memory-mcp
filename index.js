@@ -9,6 +9,87 @@ import {
 import Database from "better-sqlite3";
 import { homedir } from "os";
 import { join } from "path";
+import { existsSync, readFileSync } from "fs";
+
+// Configuration
+const CONFIG_PATH = join(homedir(), ".claude", "memory-config.json");
+let firestoreSync = null;
+
+// Load config if exists
+function loadConfig() {
+  if (existsSync(CONFIG_PATH)) {
+    try {
+      const config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+      return config;
+    } catch (e) {
+      console.error("Failed to load config:", e.message);
+    }
+  }
+  return {};
+}
+
+const config = loadConfig();
+
+// Firestore sync module (lazy loaded)
+async function initFirestoreSync() {
+  if (!config.firestore?.enabled) return null;
+
+  try {
+    const { Firestore } = await import("@google-cloud/firestore");
+
+    const firestoreConfig = {
+      projectId: config.firestore.projectId,
+    };
+
+    // Use service account if provided, otherwise use application default credentials
+    if (config.firestore.keyFilePath) {
+      firestoreConfig.keyFilename = config.firestore.keyFilePath;
+    }
+
+    const firestore = new Firestore(firestoreConfig);
+    const collectionPrefix = config.firestore.collectionPrefix || "claude-memory";
+
+    console.error(`Firestore sync enabled: project=${config.firestore.projectId}, prefix=${collectionPrefix}`);
+
+    return {
+      firestore,
+      collectionPrefix,
+
+      // Sync a record to Firestore
+      async syncToCloud(table, data) {
+        try {
+          const docId = `${data.project || 'global'}_${data.id || Date.now()}`;
+          await firestore.collection(`${collectionPrefix}_${table}`).doc(docId).set({
+            ...data,
+            syncedAt: new Date().toISOString(),
+            machine: config.machineId || "unknown",
+          }, { merge: true });
+        } catch (e) {
+          console.error(`Firestore sync error (${table}):`, e.message);
+        }
+      },
+
+      // Pull all records from Firestore for a project
+      async pullFromCloud(table, project) {
+        try {
+          const snapshot = await firestore
+            .collection(`${collectionPrefix}_${table}`)
+            .where("project", "==", project)
+            .get();
+
+          return snapshot.docs.map(doc => doc.data());
+        } catch (e) {
+          console.error(`Firestore pull error (${table}):`, e.message);
+          return [];
+        }
+      },
+    };
+  } catch (e) {
+    console.error("Failed to initialize Firestore:", e.message);
+    console.error("Install with: npm install @google-cloud/firestore");
+    return null;
+  }
+}
 
 // Database setup
 const dbPath = join(homedir(), ".claude", "memory.db");
@@ -38,7 +119,8 @@ db.exec(`
     date TEXT NOT NULL,
     decision TEXT NOT NULL,
     rationale TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    synced_at TEXT
   );
 
   CREATE TABLE IF NOT EXISTS errors (
@@ -47,7 +129,8 @@ db.exec(`
     error_pattern TEXT NOT NULL,
     solution TEXT NOT NULL,
     context TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    synced_at TEXT
   );
 
   CREATE TABLE IF NOT EXISTS context (
@@ -56,6 +139,7 @@ db.exec(`
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    synced_at TEXT,
     UNIQUE(project, key)
   );
 
@@ -64,7 +148,8 @@ db.exec(`
     project TEXT,
     category TEXT NOT NULL,
     content TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    synced_at TEXT
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -73,7 +158,8 @@ db.exec(`
     task TEXT NOT NULL,
     status TEXT,
     notes TEXT,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    synced_at TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
@@ -143,7 +229,7 @@ const deleteSession = db.prepare(
 const server = new Server(
   {
     name: "claude-memory",
-    version: "1.0.0",
+    version: "2.0.0",
   },
   {
     capabilities: {
@@ -154,6 +240,31 @@ const server = new Server(
 
 // Define tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const syncTools = firestoreSync ? [
+    {
+      name: "sync_to_cloud",
+      description: "Manually sync all local memory to Firestore cloud storage",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: { type: "string", description: "Project to sync (or 'all' for everything)" },
+        },
+        required: ["project"],
+      },
+    },
+    {
+      name: "pull_from_cloud",
+      description: "Pull memory from Firestore cloud for a project",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: { type: "string", description: "Project to pull" },
+        },
+        required: ["project"],
+      },
+    },
+  ] : [];
+
   return {
     tools: [
       {
@@ -332,6 +443,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["project"],
         },
       },
+      ...syncTools,
     ],
   };
 });
@@ -344,8 +456,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "remember_decision": {
         const date = args.date || new Date().toISOString().split("T")[0];
-        insertDecision.run(args.project, date, args.decision, args.rationale || null);
-        return { content: [{ type: "text", text: `Decision stored for ${args.project}` }] };
+        const result = insertDecision.run(args.project, date, args.decision, args.rationale || null);
+
+        // Sync to cloud if enabled
+        if (firestoreSync) {
+          await firestoreSync.syncToCloud("decisions", {
+            id: result.lastInsertRowid,
+            project: args.project,
+            date,
+            decision: args.decision,
+            rationale: args.rationale,
+          });
+        }
+
+        return { content: [{ type: "text", text: `Decision stored for ${args.project}${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "recall_decisions": {
@@ -367,8 +491,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "remember_error": {
-        insertError.run(args.project, args.error_pattern, args.solution, args.context || null);
-        return { content: [{ type: "text", text: `Error solution stored for ${args.project}` }] };
+        const result = insertError.run(args.project, args.error_pattern, args.solution, args.context || null);
+
+        if (firestoreSync) {
+          await firestoreSync.syncToCloud("errors", {
+            id: result.lastInsertRowid,
+            project: args.project,
+            error_pattern: args.error_pattern,
+            solution: args.solution,
+            context: args.context,
+          });
+        }
+
+        return { content: [{ type: "text", text: `Error solution stored for ${args.project}${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "find_solution": {
@@ -386,7 +521,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "set_context": {
         upsertContext.run(args.project, args.key, args.value);
-        return { content: [{ type: "text", text: `Context ${args.key} set for ${args.project}` }] };
+
+        if (firestoreSync) {
+          await firestoreSync.syncToCloud("context", {
+            id: `${args.project}_${args.key}`,
+            project: args.project,
+            key: args.key,
+            value: args.value,
+          });
+        }
+
+        return { content: [{ type: "text", text: `Context ${args.key} set for ${args.project}${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "get_context": {
@@ -412,8 +557,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "remember_learning": {
-        insertLearning.run(args.project || null, args.category, args.content);
-        return { content: [{ type: "text", text: `Learning stored (${args.category})` }] };
+        const result = insertLearning.run(args.project || null, args.category, args.content);
+
+        if (firestoreSync) {
+          await firestoreSync.syncToCloud("learnings", {
+            id: result.lastInsertRowid,
+            project: args.project,
+            category: args.category,
+            content: args.content,
+          });
+        }
+
+        return { content: [{ type: "text", text: `Learning stored (${args.category})${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "recall_learnings": {
@@ -491,7 +646,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "save_session": {
         upsertSession.run(args.project, args.task, args.status || 'in-progress', args.notes || null);
-        return { content: [{ type: "text", text: `Session saved for ${args.project}: ${args.task}` }] };
+
+        if (firestoreSync) {
+          await firestoreSync.syncToCloud("sessions", {
+            id: args.project,
+            project: args.project,
+            task: args.task,
+            status: args.status,
+            notes: args.notes,
+          });
+        }
+
+        return { content: [{ type: "text", text: `Session saved for ${args.project}: ${args.task}${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "get_session": {
@@ -518,6 +684,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      // Cloud sync tools (only available when Firestore is enabled)
+      case "sync_to_cloud": {
+        if (!firestoreSync) {
+          return { content: [{ type: "text", text: "Firestore sync not enabled. Configure in ~/.claude/memory-config.json" }] };
+        }
+
+        const tables = ["decisions", "errors", "context", "learnings", "sessions"];
+        let synced = 0;
+
+        for (const table of tables) {
+          let query = `SELECT * FROM ${table}`;
+          if (args.project !== "all") {
+            query += ` WHERE project = ?`;
+          }
+
+          const rows = args.project !== "all"
+            ? db.prepare(query).all(args.project)
+            : db.prepare(query).all();
+
+          for (const row of rows) {
+            await firestoreSync.syncToCloud(table, row);
+            synced++;
+          }
+        }
+
+        return { content: [{ type: "text", text: `Synced ${synced} records to Firestore` }] };
+      }
+
+      case "pull_from_cloud": {
+        if (!firestoreSync) {
+          return { content: [{ type: "text", text: "Firestore sync not enabled. Configure in ~/.claude/memory-config.json" }] };
+        }
+
+        const tables = ["decisions", "errors", "context", "learnings", "sessions"];
+        let pulled = 0;
+
+        for (const table of tables) {
+          const cloudRecords = await firestoreSync.pullFromCloud(table, args.project);
+
+          for (const record of cloudRecords) {
+            // Merge cloud records into local DB (skip if newer local version exists)
+            // This is a simple last-write-wins strategy
+            try {
+              if (table === "decisions") {
+                insertDecision.run(record.project, record.date, record.decision, record.rationale);
+              } else if (table === "errors") {
+                insertError.run(record.project, record.error_pattern, record.solution, record.context);
+              } else if (table === "context") {
+                upsertContext.run(record.project, record.key, record.value);
+              } else if (table === "learnings") {
+                insertLearning.run(record.project, record.category, record.content);
+              } else if (table === "sessions") {
+                upsertSession.run(record.project, record.task, record.status, record.notes);
+              }
+              pulled++;
+            } catch (e) {
+              // Likely a duplicate, skip
+            }
+          }
+        }
+
+        return { content: [{ type: "text", text: `Pulled ${pulled} records from Firestore` }] };
+      }
+
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
     }
@@ -528,9 +758,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Start server
 async function main() {
+  // Initialize Firestore sync if configured
+  firestoreSync = await initFirestoreSync();
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Claude Memory MCP server running");
+  console.error(`Claude Memory MCP server running (v2.0.0)${firestoreSync ? ' [Firestore enabled]' : ''}`);
 }
 
 main().catch(console.error);

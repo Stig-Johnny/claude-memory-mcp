@@ -9,6 +9,7 @@ A Model Context Protocol (MCP) server that provides persistent memory capabiliti
 - **Project Context**: Key-value storage for project-specific settings (SDK versions, URLs, etc.)
 - **Learnings**: Capture patterns, gotchas, and best practices
 - **Sessions**: Save and restore work session state
+- **Cloud Sync** (optional): Sync memory across machines using Google Cloud Firestore
 
 ## Installation
 
@@ -34,6 +35,12 @@ cd ~/.claude/mcp-servers/claude-memory
 npm install
 ```
 
+### With Firestore Cloud Sync (Optional)
+
+```bash
+npm install @google-cloud/firestore
+```
+
 ## Configuration
 
 Add to your Claude Code MCP settings (`~/.claude/settings.json`):
@@ -54,6 +61,58 @@ Replace `YOUR_USERNAME` with your actual username.
 ## Database Location
 
 The SQLite database is stored at `~/.claude/memory.db`. This file persists across Claude Code sessions.
+
+## Cloud Sync with Firestore
+
+To sync your memory across multiple machines, configure Firestore:
+
+### 1. Create a Google Cloud Project
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project or select an existing one
+3. Enable the Firestore API
+
+### 2. Create a Service Account
+
+1. Go to IAM & Admin > Service Accounts
+2. Create a new service account with "Cloud Datastore User" role
+3. Create and download a JSON key file
+4. Save it somewhere secure (e.g., `~/.claude/firestore-key.json`)
+
+### 3. Configure the MCP Server
+
+Create `~/.claude/memory-config.json`:
+
+```json
+{
+  "machineId": "macbook-pro",
+  "firestore": {
+    "enabled": true,
+    "projectId": "your-gcp-project-id",
+    "keyFilePath": "/Users/YOUR_USERNAME/.claude/firestore-key.json",
+    "collectionPrefix": "claude-memory"
+  }
+}
+```
+
+### 4. Sync Tools
+
+When Firestore is enabled, two additional tools become available:
+
+| Tool | Description |
+|------|-------------|
+| `sync_to_cloud` | Push all local memory to Firestore |
+| `pull_from_cloud` | Pull memory from Firestore for a project |
+
+### Alternative: Application Default Credentials
+
+If you have `gcloud` CLI configured, you can omit `keyFilePath` and use ADC:
+
+```bash
+gcloud auth application-default login
+```
+
+Then just set `enabled`, `projectId`, and `collectionPrefix` in the config.
 
 ## Available Tools
 
@@ -101,6 +160,13 @@ The SQLite database is stored at `~/.claude/memory.db`. This file persists acros
 |------|-------------|
 | `search_all` | Search across all memory types |
 
+### Cloud Sync (when Firestore enabled)
+
+| Tool | Description |
+|------|-------------|
+| `sync_to_cloud` | Push local memory to Firestore |
+| `pull_from_cloud` | Pull memory from Firestore |
+
 ## Usage Examples
 
 ### Store a Decision
@@ -143,6 +209,16 @@ get_context(project: "my-project")
 recall_decisions(project: "my-project", limit: 5)
 ```
 
+### Sync Across Machines
+
+```
+# On Machine A (after making changes)
+sync_to_cloud(project: "my-project")
+
+# On Machine B (to get those changes)
+pull_from_cloud(project: "my-project")
+```
+
 ## Database Schema
 
 ```sql
@@ -153,7 +229,8 @@ CREATE TABLE decisions (
   date TEXT NOT NULL,
   decision TEXT NOT NULL,
   rationale TEXT,
-  created_at TEXT
+  created_at TEXT,
+  synced_at TEXT
 );
 
 -- Errors
@@ -163,7 +240,8 @@ CREATE TABLE errors (
   error_pattern TEXT NOT NULL,
   solution TEXT NOT NULL,
   context TEXT,
-  created_at TEXT
+  created_at TEXT,
+  synced_at TEXT
 );
 
 -- Context (key-value store)
@@ -173,6 +251,7 @@ CREATE TABLE context (
   key TEXT NOT NULL,
   value TEXT NOT NULL,
   updated_at TEXT,
+  synced_at TEXT,
   UNIQUE(project, key)
 );
 
@@ -182,7 +261,8 @@ CREATE TABLE learnings (
   project TEXT,  -- NULL for global learnings
   category TEXT NOT NULL,
   content TEXT NOT NULL,
-  created_at TEXT
+  created_at TEXT,
+  synced_at TEXT
 );
 
 -- Sessions
@@ -192,7 +272,8 @@ CREATE TABLE sessions (
   task TEXT NOT NULL,
   status TEXT,
   notes TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  synced_at TEXT
 );
 ```
 
@@ -219,6 +300,34 @@ sqlite3 ~/.claude/memory.db
 .tables
 SELECT * FROM decisions WHERE project = 'my-project';
 ```
+
+### Export to Firestore
+
+If you have existing local data and want to migrate to cloud:
+
+```
+sync_to_cloud(project: "all")
+```
+
+## Troubleshooting
+
+### Firestore Not Connecting
+
+1. Check that `@google-cloud/firestore` is installed:
+   ```bash
+   npm list @google-cloud/firestore
+   ```
+
+2. Verify your config file exists and is valid JSON:
+   ```bash
+   cat ~/.claude/memory-config.json | jq
+   ```
+
+3. Check the MCP server logs for errors (visible in Claude Code console)
+
+### Permission Denied
+
+Make sure your service account has the "Cloud Datastore User" role in IAM.
 
 ## License
 
