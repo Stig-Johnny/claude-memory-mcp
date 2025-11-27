@@ -120,7 +120,8 @@ db.exec(`
     decision TEXT NOT NULL,
     rationale TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT
+    synced_at TEXT,
+    archived INTEGER DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS errors (
@@ -130,7 +131,8 @@ db.exec(`
     solution TEXT NOT NULL,
     context TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT
+    synced_at TEXT,
+    archived INTEGER DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS context (
@@ -149,7 +151,8 @@ db.exec(`
     category TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT
+    synced_at TEXT,
+    archived INTEGER DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -169,25 +172,36 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 `);
 
+// Add archived column to existing tables if missing (migration)
+try {
+  db.exec(`ALTER TABLE decisions ADD COLUMN archived INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE errors ADD COLUMN archived INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE learnings ADD COLUMN archived INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+
 // Prepared statements
 const insertDecision = db.prepare(
   "INSERT INTO decisions (project, date, decision, rationale) VALUES (?, ?, ?, ?)"
 );
 const getDecisions = db.prepare(
-  "SELECT * FROM decisions WHERE project = ? ORDER BY date DESC LIMIT ?"
+  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY date DESC LIMIT ?"
 );
 const searchDecisions = db.prepare(
-  "SELECT * FROM decisions WHERE project = ? AND (decision LIKE ? OR rationale LIKE ?) ORDER BY date DESC"
+  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) AND (decision LIKE ? OR rationale LIKE ?) ORDER BY date DESC"
 );
 
 const insertError = db.prepare(
   "INSERT INTO errors (project, error_pattern, solution, context) VALUES (?, ?, ?, ?)"
 );
 const findSolution = db.prepare(
-  "SELECT * FROM errors WHERE project = ? AND error_pattern LIKE ? ORDER BY created_at DESC LIMIT 5"
+  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) AND error_pattern LIKE ? ORDER BY created_at DESC LIMIT 5"
 );
 const getRecentErrors = db.prepare(
-  "SELECT * FROM errors WHERE project = ? ORDER BY created_at DESC LIMIT ?"
+  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT ?"
 );
 
 const upsertContext = db.prepare(`
@@ -208,10 +222,10 @@ const insertLearning = db.prepare(
   "INSERT INTO learnings (project, category, content) VALUES (?, ?, ?)"
 );
 const getLearnings = db.prepare(
-  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) ORDER BY created_at DESC LIMIT ?"
+  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT ?"
 );
 const searchLearnings = db.prepare(
-  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND content LIKE ? ORDER BY created_at DESC"
+  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) AND content LIKE ? ORDER BY created_at DESC"
 );
 
 const upsertSession = db.prepare(`
@@ -229,7 +243,7 @@ const deleteSession = db.prepare(
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.0.0",
+    version: "2.1.0",
   },
   {
     capabilities: {
@@ -441,6 +455,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             project: { type: "string", description: "Project name" },
           },
           required: ["project"],
+        },
+      },
+      {
+        name: "memory_status",
+        description: "Get a summary of all memory for a project - call this at session start to quickly recall context",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project: { type: "string", description: "Project name" },
+          },
+          required: ["project"],
+        },
+      },
+      {
+        name: "archive",
+        description: "Archive old decisions, errors, or learnings by ID (they won't appear in queries but aren't deleted)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            type: { type: "string", description: "Type to archive: 'decision', 'error', or 'learning'" },
+            id: { type: "number", description: "ID of the item to archive" },
+          },
+          required: ["type", "id"],
+        },
+      },
+      {
+        name: "prune",
+        description: "Permanently delete archived items older than specified days",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project: { type: "string", description: "Project name (or 'all' for all projects)" },
+            days: { type: "number", description: "Delete archived items older than this many days (default: 90)" },
+          },
+          required: ["project"],
+        },
+      },
+      {
+        name: "export_memory",
+        description: "Export all memory for a project to JSON format",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project: { type: "string", description: "Project name" },
+            include_archived: { type: "boolean", description: "Include archived items (default: false)" },
+          },
+          required: ["project"],
+        },
+      },
+      {
+        name: "import_memory",
+        description: "Import memory from JSON format (merges with existing data)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            json_data: { type: "string", description: "JSON string containing memory data to import" },
+          },
+          required: ["json_data"],
         },
       },
       ...syncTools,
@@ -684,6 +756,204 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "memory_status": {
+        // Get comprehensive summary for session start
+        const session = getSession.get(args.project);
+        const contextItems = getContext.all(args.project);
+        const decisions = getDecisions.all(args.project, 5);
+        const learnings = getLearnings.all(args.project, 5);
+        const errors = getRecentErrors.all(args.project, 3);
+
+        // Also get global learnings
+        const globalLearnings = db.prepare(
+          "SELECT * FROM learnings WHERE project IS NULL AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT 5"
+        ).all();
+
+        let output = [`# Memory Status for ${args.project}\n`];
+
+        // Session status
+        if (session) {
+          const timeAgo = getTimeAgo(session.updated_at);
+          output.push(`## 📋 Active Session (${timeAgo})`);
+          output.push(`**Task:** ${session.task}`);
+          output.push(`**Status:** ${session.status || 'in-progress'}`);
+          if (session.notes) output.push(`**Notes:** ${session.notes}`);
+          output.push('');
+        }
+
+        // Context
+        if (contextItems.length > 0) {
+          output.push(`## ⚙️ Context (${contextItems.length} items)`);
+          contextItems.forEach(c => output.push(`- **${c.key}:** ${c.value}`));
+          output.push('');
+        }
+
+        // Recent decisions
+        if (decisions.length > 0) {
+          output.push(`## 🎯 Recent Decisions`);
+          decisions.forEach(d => output.push(`- [${d.date}] ${d.decision}`));
+          output.push('');
+        }
+
+        // Recent learnings (project + global)
+        const allLearnings = [...learnings, ...globalLearnings.filter(g => !learnings.find(l => l.id === g.id))];
+        if (allLearnings.length > 0) {
+          output.push(`## 💡 Learnings`);
+          allLearnings.slice(0, 5).forEach(l => output.push(`- [${l.category}] ${l.content}${l.project ? '' : ' (global)'}`));
+          output.push('');
+        }
+
+        // Recent errors
+        if (errors.length > 0) {
+          output.push(`## 🐛 Recent Error Solutions`);
+          errors.forEach(e => output.push(`- **${e.error_pattern}**: ${e.solution}`));
+          output.push('');
+        }
+
+        // Stats
+        const stats = {
+          decisions: db.prepare("SELECT COUNT(*) as count FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          errors: db.prepare("SELECT COUNT(*) as count FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          learnings: db.prepare("SELECT COUNT(*) as count FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          context: contextItems.length,
+        };
+        output.push(`## 📊 Stats`);
+        output.push(`Decisions: ${stats.decisions} | Errors: ${stats.errors} | Learnings: ${stats.learnings} | Context: ${stats.context}`);
+
+        return { content: [{ type: "text", text: output.join('\n') }] };
+      }
+
+      case "archive": {
+        const tableMap = {
+          'decision': 'decisions',
+          'error': 'errors',
+          'learning': 'learnings',
+        };
+        const table = tableMap[args.type];
+        if (!table) {
+          return { content: [{ type: "text", text: `Invalid type: ${args.type}. Use 'decision', 'error', or 'learning'` }] };
+        }
+
+        const result = db.prepare(`UPDATE ${table} SET archived = 1 WHERE id = ?`).run(args.id);
+        return {
+          content: [{
+            type: "text",
+            text: result.changes > 0
+              ? `Archived ${args.type} #${args.id}`
+              : `No ${args.type} found with ID ${args.id}`
+          }]
+        };
+      }
+
+      case "prune": {
+        const days = args.days || 90;
+        const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+        let totalDeleted = 0;
+        const tables = ['decisions', 'errors', 'learnings'];
+
+        for (const table of tables) {
+          let query = `DELETE FROM ${table} WHERE archived = 1 AND created_at < ?`;
+          if (args.project !== 'all') {
+            query += ` AND project = ?`;
+          }
+
+          const result = args.project !== 'all'
+            ? db.prepare(query).run(cutoffDate, args.project)
+            : db.prepare(query).run(cutoffDate);
+
+          totalDeleted += result.changes;
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: `Pruned ${totalDeleted} archived items older than ${days} days`
+          }]
+        };
+      }
+
+      case "export_memory": {
+        const includeArchived = args.include_archived || false;
+        const archivedFilter = includeArchived ? '' : 'AND (archived IS NULL OR archived = 0)';
+
+        const data = {
+          project: args.project,
+          exported_at: new Date().toISOString(),
+          decisions: db.prepare(`SELECT * FROM decisions WHERE project = ? ${archivedFilter}`).all(args.project),
+          errors: db.prepare(`SELECT * FROM errors WHERE project = ? ${archivedFilter}`).all(args.project),
+          context: db.prepare(`SELECT * FROM context WHERE project = ?`).all(args.project),
+          learnings: db.prepare(`SELECT * FROM learnings WHERE project = ? ${archivedFilter}`).all(args.project),
+          session: getSession.get(args.project),
+        };
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(data, null, 2)
+          }]
+        };
+      }
+
+      case "import_memory": {
+        try {
+          const data = JSON.parse(args.json_data);
+          let imported = { decisions: 0, errors: 0, context: 0, learnings: 0 };
+
+          // Import decisions
+          if (data.decisions) {
+            for (const d of data.decisions) {
+              try {
+                insertDecision.run(d.project, d.date, d.decision, d.rationale);
+                imported.decisions++;
+              } catch (e) { /* skip duplicates */ }
+            }
+          }
+
+          // Import errors
+          if (data.errors) {
+            for (const e of data.errors) {
+              try {
+                insertError.run(e.project, e.error_pattern, e.solution, e.context);
+                imported.errors++;
+              } catch (e) { /* skip duplicates */ }
+            }
+          }
+
+          // Import context (upsert)
+          if (data.context) {
+            for (const c of data.context) {
+              upsertContext.run(c.project, c.key, c.value);
+              imported.context++;
+            }
+          }
+
+          // Import learnings
+          if (data.learnings) {
+            for (const l of data.learnings) {
+              try {
+                insertLearning.run(l.project, l.category, l.content);
+                imported.learnings++;
+              } catch (e) { /* skip duplicates */ }
+            }
+          }
+
+          // Import session
+          if (data.session) {
+            upsertSession.run(data.session.project, data.session.task, data.session.status, data.session.notes);
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: `Imported: ${imported.decisions} decisions, ${imported.errors} errors, ${imported.context} context items, ${imported.learnings} learnings`
+            }]
+          };
+        } catch (e) {
+          return { content: [{ type: "text", text: `Import failed: ${e.message}` }] };
+        }
+      }
+
       // Cloud sync tools (only available when Firestore is enabled)
       case "sync_to_cloud": {
         if (!firestoreSync) {
@@ -763,7 +1033,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`Claude Memory MCP server running (v2.0.0)${firestoreSync ? ' [Firestore enabled]' : ''}`);
+  console.error(`Claude Memory MCP server running (v2.1.0)${firestoreSync ? ' [Firestore enabled]' : ''}`);
 }
 
 main().catch(console.error);

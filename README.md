@@ -221,6 +221,45 @@ find_solution(project: "my-app", error: "UNIQUE constraint")
 search_all(project: "my-app", query: "authentication")
 ```
 
+### Quick Session Start (NEW in v2.1)
+
+Instead of calling multiple tools, use `memory_status` for a comprehensive overview:
+
+```
+memory_status(project: "my-app")
+```
+
+Returns: active session, all context, recent decisions, learnings, error solutions, and stats in one call.
+
+### Archiving Old Data
+
+```
+# Archive a specific decision (still in DB but hidden from queries)
+archive(type: "decision", id: 42)
+
+# Archive an error solution
+archive(type: "error", id: 15)
+
+# Permanently delete archived items older than 90 days
+prune(project: "my-app", days: 90)
+
+# Prune all projects
+prune(project: "all", days: 90)
+```
+
+### Export / Import Memory
+
+```
+# Export project memory to JSON
+export_memory(project: "my-app")
+
+# Export including archived items
+export_memory(project: "my-app", include_archived: true)
+
+# Import from JSON (merges with existing data)
+import_memory(json_data: '{"decisions": [...], "context": [...]}')
+```
+
 ---
 
 ## Cloud Sync with Firestore (Multi-Machine Setup)
@@ -351,12 +390,22 @@ On each additional machine:
 | `save_session` | Save current work state before ending |
 | `get_session` | Resume from last saved session |
 | `clear_session` | Clear session when work is complete |
+| `memory_status` | **NEW** Get comprehensive summary for session start (context, decisions, learnings, errors, stats) |
 
 ### Search
 
 | Tool | Description |
 |------|-------------|
 | `search_all` | Search across all memory types |
+
+### Maintenance
+
+| Tool | Description |
+|------|-------------|
+| `archive` | **NEW** Archive old items by ID (won't appear in queries but not deleted) |
+| `prune` | **NEW** Permanently delete archived items older than N days |
+| `export_memory` | **NEW** Export all project memory to JSON |
+| `import_memory` | **NEW** Import memory from JSON (merges with existing) |
 
 ### Cloud Sync (when Firestore enabled)
 
