@@ -21,7 +21,11 @@ git clone https://github.com/Stig-Johnny/claude-memory-mcp.git ~/.claude/mcp-ser
 cd ~/.claude/mcp-servers/claude-memory
 npm install
 
-# 3. Add to Claude Code settings (~/.claude/settings.json)
+# 3. Install the slash command (optional but recommended)
+mkdir -p ~/.claude/commands
+cp ~/.claude/mcp-servers/claude-memory/commands/load-memory.md ~/.claude/commands/
+
+# 4. Add to Claude Code settings (~/.claude/settings.json)
 ```
 
 Add this to your `~/.claude/settings.json`:
@@ -39,7 +43,48 @@ Add this to your `~/.claude/settings.json`:
 
 Replace `YOUR_USERNAME` with your actual username (run `whoami` to check).
 
-**4. Restart Claude Code** to load the MCP server.
+**5. Restart Claude Code** to load the MCP server.
+
+---
+
+## Slash Command: /load-memory
+
+The included `/load-memory` command makes it easy to load all context at session start.
+
+### Usage
+
+```
+/load-memory my-project
+```
+
+This loads:
+1. Global context (user info, preferences)
+2. Project context (URLs, versions, config)
+3. Saved session state (if any)
+4. Recent decisions (last 10)
+5. Recent learnings (last 10)
+
+### Installation
+
+The slash command is installed in Step 3 of Quick Start. If you skipped it:
+
+```bash
+mkdir -p ~/.claude/commands
+cp ~/.claude/mcp-servers/claude-memory/commands/load-memory.md ~/.claude/commands/
+```
+
+### Per-Project Customization
+
+You can create project-specific load commands. Copy to your project's `.claude/commands/`:
+
+```bash
+mkdir -p /path/to/your-project/.claude/commands
+cp ~/.claude/mcp-servers/claude-memory/commands/load-memory.md /path/to/your-project/.claude/commands/
+```
+
+Then customize it with project-specific instructions (e.g., set an assistant persona, add project-specific reminders).
+
+---
 
 ## Database Location
 
