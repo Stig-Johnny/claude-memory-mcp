@@ -115,6 +115,29 @@ recall_decisions(project: "claude-memory-mcp", limit: 5)
 - Design decisions for the MCP architecture
 - Bug fixes that were non-obvious
 
+### Memory Maintenance (Keep Updated!)
+
+After making changes to any project, update memory immediately:
+
+| Change Type | Action |
+|-------------|--------|
+| New DB migration | Update `database_schema` context |
+| New API endpoint | Update `api_endpoints` context |
+| New file/module | Update `architecture_overview` context |
+| Version bump | `set_context(key: "sdk_version", value: "X.X.X")` |
+| Bug fix with lesson | `remember_learning(category: "gotcha", ...)` |
+| Architecture decision | `remember_decision(...)` |
+| Error solution found | `remember_error(...)` |
+
+**Triggers to watch for:**
+- Creating new source files
+- Adding routes or endpoints
+- Running database migrations
+- Fixing bugs that took significant time
+- Making decisions with trade-offs
+
+**At session end:** Verify memory is updated before closing.
+
 ## Release Process
 
 1. Update version in `package.json`

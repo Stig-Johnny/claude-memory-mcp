@@ -123,6 +123,29 @@ Always run these to load context:
 - It took significant debugging time
 ```
 
+### Memory Maintenance (Keep Updated!)
+
+To keep memory useful, update it immediately after making changes:
+
+| Change Type | Action |
+|-------------|--------|
+| New DB migration | Update `database_schema` context with new tables/columns |
+| New API endpoint | Update `api_endpoints` context with new route |
+| New file/module | Update `architecture_overview` context |
+| Version bump | `set_context(key: "sdk_version", value: "X.X.X")` |
+| Bug fix with lesson | `remember_learning(category: "gotcha", ...)` |
+| Architecture decision | `remember_decision(decision: "...", rationale: "...")` |
+| Error solution found | `remember_error(error_pattern: "...", solution: "...")` |
+
+**Triggers to watch for:**
+- Creating new source files
+- Adding routes or endpoints
+- Running or creating database migrations
+- Fixing bugs that took significant debugging time
+- Making decisions with trade-offs
+
+**At session end:** If significant changes were made, verify memory is updated before closing.
+
 ---
 
 ## Best Practices
