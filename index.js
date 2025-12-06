@@ -243,7 +243,7 @@ const deleteSession = db.prepare(
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.1.0",
+    version: "2.2.0",
   },
   {
     capabilities: {
@@ -303,6 +303,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             project: { type: "string", description: "Project name" },
             search: { type: "string", description: "Optional search term" },
+            limit: { type: "number", description: "Max results (default 10)" },
+          },
+          required: ["project"],
+        },
+      },
+      {
+        name: "list_decisions",
+        description: "List recent decisions for a project without requiring a search term",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project: { type: "string", description: "Project name" },
             limit: { type: "number", description: "Max results (default 10)" },
           },
           required: ["project"],
@@ -515,6 +527,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["json_data"],
         },
       },
+      {
+        name: "memory_stats",
+        description: "Get detailed memory usage statistics including counts per project and database size",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project: { type: "string", description: "Optional: filter stats to a specific project" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "bulk_cleanup",
+        description: "Bulk delete old or archived items from memory",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project: { type: "string", description: "Project name (or 'all' for all projects)" },
+            type: { type: "string", description: "Type to clean: 'decisions', 'errors', 'learnings', or 'all'" },
+            older_than_days: { type: "number", description: "Delete items older than this many days" },
+            archived_only: { type: "boolean", description: "Only delete archived items (default: true)" },
+          },
+          required: ["project", "older_than_days"],
+        },
+      },
       ...syncTools,
     ],
   };
@@ -557,6 +594,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: results.length > 0
               ? results.map(r => `[${r.date}] ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`).join("\n\n")
+              : "No decisions found for this project"
+          }]
+        };
+      }
+
+      case "list_decisions": {
+        const results = getDecisions.all(args.project, args.limit || 10);
+        return {
+          content: [{
+            type: "text",
+            text: results.length > 0
+              ? results.map(r => `[ID:${r.id}] [${r.date}] ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`).join("\n\n")
               : "No decisions found for this project"
           }]
         };
@@ -952,6 +1001,131 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } catch (e) {
           return { content: [{ type: "text", text: `Import failed: ${e.message}` }] };
         }
+      }
+
+      case "memory_stats": {
+        const { statSync } = await import("fs");
+
+        // Get database file size
+        let dbSize = "unknown";
+        try {
+          const stats = statSync(dbPath);
+          const sizeKB = (stats.size / 1024).toFixed(2);
+          const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
+          dbSize = stats.size > 1024 * 1024 ? `${sizeMB} MB` : `${sizeKB} KB`;
+        } catch (e) { /* ignore */ }
+
+        let output = [`# Memory Statistics\n`, `Database size: ${dbSize}\n`];
+
+        if (args.project) {
+          // Stats for specific project
+          const stats = {
+            decisions: db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived FROM decisions WHERE project = ?").get(args.project),
+            errors: db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived FROM errors WHERE project = ?").get(args.project),
+            learnings: db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived FROM learnings WHERE project = ?").get(args.project),
+            context: db.prepare("SELECT COUNT(*) as total FROM context WHERE project = ?").get(args.project),
+          };
+
+          output.push(`## Project: ${args.project}`);
+          output.push(`- Decisions: ${stats.decisions.total} (${stats.decisions.archived || 0} archived)`);
+          output.push(`- Errors: ${stats.errors.total} (${stats.errors.archived || 0} archived)`);
+          output.push(`- Learnings: ${stats.learnings.total} (${stats.learnings.archived || 0} archived)`);
+          output.push(`- Context keys: ${stats.context.total}`);
+        } else {
+          // Stats for all projects
+          const projects = db.prepare(`
+            SELECT DISTINCT project FROM (
+              SELECT project FROM decisions
+              UNION SELECT project FROM errors
+              UNION SELECT project FROM context
+              UNION SELECT project FROM learnings WHERE project IS NOT NULL
+            ) ORDER BY project
+          `).all();
+
+          output.push(`## All Projects (${projects.length} total)\n`);
+
+          for (const { project } of projects) {
+            const decisions = db.prepare("SELECT COUNT(*) as count FROM decisions WHERE project = ?").get(project).count;
+            const errors = db.prepare("SELECT COUNT(*) as count FROM errors WHERE project = ?").get(project).count;
+            const learnings = db.prepare("SELECT COUNT(*) as count FROM learnings WHERE project = ?").get(project).count;
+            const context = db.prepare("SELECT COUNT(*) as count FROM context WHERE project = ?").get(project).count;
+            output.push(`**${project}**: ${decisions} decisions, ${errors} errors, ${learnings} learnings, ${context} context`);
+          }
+
+          // Global learnings
+          const globalLearnings = db.prepare("SELECT COUNT(*) as count FROM learnings WHERE project IS NULL").get().count;
+          output.push(`\n**Global learnings**: ${globalLearnings}`);
+
+          // Totals
+          const totals = {
+            decisions: db.prepare("SELECT COUNT(*) as count FROM decisions").get().count,
+            errors: db.prepare("SELECT COUNT(*) as count FROM errors").get().count,
+            learnings: db.prepare("SELECT COUNT(*) as count FROM learnings").get().count,
+            context: db.prepare("SELECT COUNT(*) as count FROM context").get().count,
+            archived: db.prepare(`
+              SELECT
+                (SELECT COUNT(*) FROM decisions WHERE archived = 1) +
+                (SELECT COUNT(*) FROM errors WHERE archived = 1) +
+                (SELECT COUNT(*) FROM learnings WHERE archived = 1) as count
+            `).get().count,
+          };
+          output.push(`\n## Totals`);
+          output.push(`- Total decisions: ${totals.decisions}`);
+          output.push(`- Total errors: ${totals.errors}`);
+          output.push(`- Total learnings: ${totals.learnings}`);
+          output.push(`- Total context keys: ${totals.context}`);
+          output.push(`- Total archived items: ${totals.archived}`);
+        }
+
+        return { content: [{ type: "text", text: output.join('\n') }] };
+      }
+
+      case "bulk_cleanup": {
+        const days = args.older_than_days;
+        const archivedOnly = args.archived_only !== false; // default true
+        const typeFilter = args.type || 'all';
+        const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+        const tables = typeFilter === 'all'
+          ? ['decisions', 'errors', 'learnings']
+          : [typeFilter];
+
+        let totalDeleted = 0;
+        const deletedPerTable = {};
+
+        for (const table of tables) {
+          if (!['decisions', 'errors', 'learnings'].includes(table)) {
+            continue;
+          }
+
+          let conditions = ['created_at < ?'];
+          let params = [cutoffDate];
+
+          if (archivedOnly) {
+            conditions.push('archived = 1');
+          }
+
+          if (args.project !== 'all') {
+            conditions.push('project = ?');
+            params.push(args.project);
+          }
+
+          const query = `DELETE FROM ${table} WHERE ${conditions.join(' AND ')}`;
+          const result = db.prepare(query).run(...params);
+          deletedPerTable[table] = result.changes;
+          totalDeleted += result.changes;
+        }
+
+        const details = Object.entries(deletedPerTable)
+          .map(([table, count]) => `${table}: ${count}`)
+          .join(', ');
+
+        return {
+          content: [{
+            type: "text",
+            text: `Deleted ${totalDeleted} items older than ${days} days${archivedOnly ? ' (archived only)' : ''}\n${details}`
+          }]
+        };
       }
 
       // Cloud sync tools (only available when Firestore is enabled)
