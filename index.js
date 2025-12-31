@@ -157,12 +157,14 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project TEXT NOT NULL UNIQUE,
+    project TEXT NOT NULL,
+    workspace TEXT,
     task TEXT NOT NULL,
     status TEXT,
     notes TEXT,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT
+    synced_at TEXT,
+    UNIQUE(project, workspace)
   );
 
   CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
@@ -182,6 +184,45 @@ try {
 try {
   db.exec(`ALTER TABLE learnings ADD COLUMN archived INTEGER DEFAULT 0`);
 } catch (e) { /* column already exists */ }
+
+// Migration for multi-workspace support: add workspace column and update unique constraint
+try {
+  // Check if workspace column exists
+  const tableInfo = db.prepare("PRAGMA table_info(sessions)").all();
+  const hasWorkspace = tableInfo.some(col => col.name === 'workspace');
+
+  if (!hasWorkspace) {
+    // Need to recreate the table with the new schema
+    db.exec(`
+      -- Create new table with correct schema
+      CREATE TABLE sessions_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project TEXT NOT NULL,
+        workspace TEXT,
+        task TEXT NOT NULL,
+        status TEXT,
+        notes TEXT,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        synced_at TEXT,
+        UNIQUE(project, workspace)
+      );
+
+      -- Copy existing data (workspace will be NULL for existing sessions)
+      INSERT INTO sessions_new (id, project, task, status, notes, updated_at, synced_at)
+        SELECT id, project, task, status, notes, updated_at, synced_at FROM sessions;
+
+      -- Drop old table and rename new one
+      DROP TABLE sessions;
+      ALTER TABLE sessions_new RENAME TO sessions;
+
+      -- Recreate index
+      CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+    `);
+    console.error("Migrated sessions table to support multi-workspace");
+  }
+} catch (e) {
+  console.error("Sessions migration error:", e.message);
+}
 
 // Prepared statements
 const insertDecision = db.prepare(
@@ -228,22 +269,25 @@ const searchLearnings = db.prepare(
   "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) AND content LIKE ? ORDER BY created_at DESC"
 );
 
-const upsertSession = db.prepare(`
-  INSERT INTO sessions (project, task, status, notes, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-  ON CONFLICT(project) DO UPDATE SET task = excluded.task, status = excluded.status, notes = excluded.notes, updated_at = CURRENT_TIMESTAMP
+const upsertSessionWithWorkspace = db.prepare(`
+  INSERT INTO sessions (project, workspace, task, status, notes, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+  ON CONFLICT(project, workspace) DO UPDATE SET task = excluded.task, status = excluded.status, notes = excluded.notes, updated_at = CURRENT_TIMESTAMP
 `);
-const getSession = db.prepare(
-  "SELECT * FROM sessions WHERE project = ?"
+const getSessionWithWorkspace = db.prepare(
+  "SELECT * FROM sessions WHERE project = ? AND (workspace = ? OR (workspace IS NULL AND ? IS NULL))"
 );
-const deleteSession = db.prepare(
-  "DELETE FROM sessions WHERE project = ?"
+const deleteSessionWithWorkspace = db.prepare(
+  "DELETE FROM sessions WHERE project = ? AND (workspace = ? OR (workspace IS NULL AND ? IS NULL))"
+);
+const getAllSessionsForProject = db.prepare(
+  "SELECT * FROM sessions WHERE project = ? ORDER BY updated_at DESC"
 );
 
 // Create MCP server
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.2.0",
+    version: "2.3.0",
   },
   {
     capabilities: {
@@ -440,6 +484,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name" },
+            workspace: { type: "string", description: "Workspace name (e.g., 'claude-3', 'claude-5') - use to avoid conflicts between Claude instances" },
             task: { type: "string", description: "What you're working on (e.g., 'Issue #22 - Firestore migration')" },
             status: { type: "string", description: "Current status (e.g., 'in-progress', 'blocked', 'ready-for-review')" },
             notes: { type: "string", description: "Next steps or important context for resuming" },
@@ -454,6 +499,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name" },
+            workspace: { type: "string", description: "Workspace name (e.g., 'claude-3', 'claude-5') - if not provided, returns all sessions for project" },
           },
           required: ["project"],
         },
@@ -465,6 +511,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name" },
+            workspace: { type: "string", description: "Workspace name (e.g., 'claude-3', 'claude-5') - if not provided, clears all sessions for project" },
           },
           required: ["project"],
         },
@@ -766,48 +813,81 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "save_session": {
-        upsertSession.run(args.project, args.task, args.status || 'in-progress', args.notes || null);
+        const workspace = args.workspace || null;
+        upsertSessionWithWorkspace.run(args.project, workspace, args.task, args.status || 'in-progress', args.notes || null);
 
         if (firestoreSync) {
           await firestoreSync.syncToCloud("sessions", {
-            id: args.project,
+            id: workspace ? `${args.project}:${workspace}` : args.project,
             project: args.project,
+            workspace: workspace,
             task: args.task,
             status: args.status,
             notes: args.notes,
           });
         }
 
-        return { content: [{ type: "text", text: `Session saved for ${args.project}: ${args.task}${firestoreSync ? ' (synced)' : ''}` }] };
+        const workspaceInfo = workspace ? ` (workspace: ${workspace})` : '';
+        return { content: [{ type: "text", text: `Session saved for ${args.project}${workspaceInfo}: ${args.task}${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "get_session": {
-        const session = getSession.get(args.project);
-        if (session) {
-          const timeAgo = getTimeAgo(session.updated_at);
-          return {
-            content: [{
-              type: "text",
-              text: `Last session (${timeAgo}):\nTask: ${session.task}\nStatus: ${session.status || 'in-progress'}\nNotes: ${session.notes || 'None'}`
-            }]
-          };
+        const workspace = args.workspace;
+        if (workspace !== undefined) {
+          // Get specific workspace session
+          const session = getSessionWithWorkspace.get(args.project, workspace, workspace);
+          if (session) {
+            const timeAgo = getTimeAgo(session.updated_at);
+            const workspaceInfo = session.workspace ? ` [${session.workspace}]` : '';
+            return {
+              content: [{
+                type: "text",
+                text: `Last session${workspaceInfo} (${timeAgo}):\nTask: ${session.task}\nStatus: ${session.status || 'in-progress'}\nNotes: ${session.notes || 'None'}`
+              }]
+            };
+          }
+          return { content: [{ type: "text", text: "No saved session found" }] };
+        } else {
+          // Get all sessions for project
+          const sessions = getAllSessionsForProject.all(args.project);
+          if (sessions.length > 0) {
+            const output = sessions.map(session => {
+              const timeAgo = getTimeAgo(session.updated_at);
+              const workspaceInfo = session.workspace ? `[${session.workspace}] ` : '[default] ';
+              return `${workspaceInfo}(${timeAgo}):\n  Task: ${session.task}\n  Status: ${session.status || 'in-progress'}\n  Notes: ${session.notes || 'None'}`;
+            }).join('\n\n');
+            return { content: [{ type: "text", text: output }] };
+          }
+          return { content: [{ type: "text", text: "No saved session found" }] };
         }
-        return { content: [{ type: "text", text: "No saved session found" }] };
       }
 
       case "clear_session": {
-        const result = deleteSession.run(args.project);
-        return {
-          content: [{
-            type: "text",
-            text: result.changes > 0 ? `Session cleared for ${args.project}` : "No session to clear"
-          }]
-        };
+        const workspace = args.workspace;
+        if (workspace !== undefined) {
+          const result = deleteSessionWithWorkspace.run(args.project, workspace, workspace);
+          const workspaceInfo = workspace ? ` (workspace: ${workspace})` : '';
+          return {
+            content: [{
+              type: "text",
+              text: result.changes > 0 ? `Session cleared for ${args.project}${workspaceInfo}` : "No session to clear"
+            }]
+          };
+        } else {
+          // Clear all sessions for project
+          const result = db.prepare("DELETE FROM sessions WHERE project = ?").run(args.project);
+          return {
+            content: [{
+              type: "text",
+              text: result.changes > 0 ? `All sessions cleared for ${args.project} (${result.changes} session(s))` : "No sessions to clear"
+            }]
+          };
+        }
       }
 
       case "memory_status": {
         // Get comprehensive summary for session start
-        const session = getSession.get(args.project);
+        const sessions = getAllSessionsForProject.all(args.project);
         const contextItems = getContext.all(args.project);
         const decisions = getDecisions.all(args.project, 5);
         const learnings = getLearnings.all(args.project, 5);
@@ -820,14 +900,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let output = [`# Memory Status for ${args.project}\n`];
 
-        // Session status
-        if (session) {
-          const timeAgo = getTimeAgo(session.updated_at);
-          output.push(`## 📋 Active Session (${timeAgo})`);
-          output.push(`**Task:** ${session.task}`);
-          output.push(`**Status:** ${session.status || 'in-progress'}`);
-          if (session.notes) output.push(`**Notes:** ${session.notes}`);
-          output.push('');
+        // Session status (show all workspace sessions)
+        if (sessions.length > 0) {
+          output.push(`## 📋 Active Sessions (${sessions.length})`);
+          for (const session of sessions) {
+            const timeAgo = getTimeAgo(session.updated_at);
+            const workspaceLabel = session.workspace ? `[${session.workspace}]` : '[default]';
+            output.push(`### ${workspaceLabel} (${timeAgo})`);
+            output.push(`**Task:** ${session.task}`);
+            output.push(`**Status:** ${session.status || 'in-progress'}`);
+            if (session.notes) output.push(`**Notes:** ${session.notes}`);
+            output.push('');
+          }
         }
 
         // Context
@@ -1207,7 +1291,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`Claude Memory MCP server running (v2.1.0)${firestoreSync ? ' [Firestore enabled]' : ''}`);
+  console.error(`Claude Memory MCP server running (v2.3.0)${firestoreSync ? ' [Firestore enabled]' : ''}`);
 }
 
 main().catch(console.error);
