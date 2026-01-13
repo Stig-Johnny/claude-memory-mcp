@@ -185,6 +185,18 @@ try {
   db.exec(`ALTER TABLE learnings ADD COLUMN archived INTEGER DEFAULT 0`);
 } catch (e) { /* column already exists */ }
 
+// Add priority column to decisions, errors, learnings (migration v2.5.0)
+// Priority: 0 = normal (default), 1 = high, 2 = critical
+try {
+  db.exec(`ALTER TABLE decisions ADD COLUMN priority INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE errors ADD COLUMN priority INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE learnings ADD COLUMN priority INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+
 // Migration for multi-workspace support: add workspace column and update unique constraint
 try {
   // Check if workspace column exists
@@ -229,20 +241,20 @@ const insertDecision = db.prepare(
   "INSERT INTO decisions (project, date, decision, rationale) VALUES (?, ?, ?, ?)"
 );
 const getDecisions = db.prepare(
-  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY date DESC LIMIT ?"
+  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, date DESC LIMIT ?"
 );
 const searchDecisions = db.prepare(
-  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) AND (decision LIKE ? OR rationale LIKE ?) ORDER BY date DESC"
+  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) AND (decision LIKE ? OR rationale LIKE ?) ORDER BY priority DESC, date DESC"
 );
 
 const insertError = db.prepare(
   "INSERT INTO errors (project, error_pattern, solution, context) VALUES (?, ?, ?, ?)"
 );
 const findSolution = db.prepare(
-  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) AND error_pattern LIKE ? ORDER BY created_at DESC LIMIT 5"
+  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) AND error_pattern LIKE ? ORDER BY priority DESC, created_at DESC LIMIT 5"
 );
 const getRecentErrors = db.prepare(
-  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT ?"
+  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, created_at DESC LIMIT ?"
 );
 
 const upsertContext = db.prepare(`
@@ -263,10 +275,10 @@ const insertLearning = db.prepare(
   "INSERT INTO learnings (project, category, content) VALUES (?, ?, ?)"
 );
 const getLearnings = db.prepare(
-  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT ?"
+  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, created_at DESC LIMIT ?"
 );
 const searchLearnings = db.prepare(
-  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) AND content LIKE ? ORDER BY created_at DESC"
+  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) AND content LIKE ? ORDER BY priority DESC, created_at DESC"
 );
 
 const upsertSessionWithWorkspace = db.prepare(`
@@ -287,7 +299,7 @@ const getAllSessionsForProject = db.prepare(
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.4.0",
+    version: "2.5.0",
   },
   {
     capabilities: {
@@ -549,6 +561,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             id: { type: "number", description: "ID of the item to archive" },
           },
           required: ["type", "id"],
+        },
+      },
+      {
+        name: "set_priority",
+        description: "Set priority level for a decision, error, or learning. Higher priority items are loaded first in queries.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            type: { type: "string", description: "Type: 'decision', 'error', or 'learning'" },
+            id: { type: "number", description: "ID of the item" },
+            priority: { type: "number", description: "Priority level: 0 = normal (default), 1 = high, 2 = critical" },
+          },
+          required: ["type", "id", "priority"],
         },
       },
       {
@@ -1024,11 +1049,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           output.push('');
         }
 
+        // Helper for priority indicator
+        const priorityIcon = (p) => p === 2 ? '🔴 ' : p === 1 ? '🟡 ' : '';
+
         // Decisions (with dates and rationales)
         if (decisions.length > 0) {
-          output.push(`## 🎯 Decisions (${decisions.length})`);
+          const highPriorityCount = decisions.filter(d => (d.priority || 0) > 0).length;
+          output.push(`## 🎯 Decisions (${decisions.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
           decisions.forEach(d => {
-            output.push(`- **[${d.date}]** ${d.decision}`);
+            output.push(`- ${priorityIcon(d.priority)}**[${d.date}]** ${d.decision}`);
             if (d.rationale) output.push(`  _Rationale: ${d.rationale}_`);
           });
           output.push('');
@@ -1044,16 +1073,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           });
         }
         if (allLearnings.length > 0) {
-          output.push(`## 💡 Learnings (${allLearnings.length})`);
-          allLearnings.forEach(l => output.push(`- [${l.category}] ${l.content}${l.project ? '' : ' _(global)_'}`));
+          const highPriorityCount = allLearnings.filter(l => (l.priority || 0) > 0).length;
+          output.push(`## 💡 Learnings (${allLearnings.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
+          allLearnings.forEach(l => output.push(`- ${priorityIcon(l.priority)}[${l.category}] ${l.content}${l.project ? '' : ' _(global)_'}`));
           output.push('');
         }
 
         // Error solutions
         if (errors.length > 0) {
-          output.push(`## 🐛 Error Solutions (${errors.length})`);
+          const highPriorityCount = errors.filter(e => (e.priority || 0) > 0).length;
+          output.push(`## 🐛 Error Solutions (${errors.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
           errors.forEach(e => {
-            output.push(`- **${e.error_pattern}**`);
+            output.push(`- ${priorityIcon(e.priority)}**${e.error_pattern}**`);
             output.push(`  Solution: ${e.solution}`);
             if (e.context) output.push(`  Context: ${e.context}`);
           });
@@ -1090,6 +1121,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: result.changes > 0
               ? `Archived ${args.type} #${args.id}`
+              : `No ${args.type} found with ID ${args.id}`
+          }]
+        };
+      }
+
+      case "set_priority": {
+        const tableMap = {
+          'decision': 'decisions',
+          'error': 'errors',
+          'learning': 'learnings',
+        };
+        const table = tableMap[args.type];
+        if (!table) {
+          return { content: [{ type: "text", text: `Invalid type: ${args.type}. Use 'decision', 'error', or 'learning'` }] };
+        }
+
+        const priority = args.priority;
+        if (priority < 0 || priority > 2) {
+          return { content: [{ type: "text", text: `Invalid priority: ${priority}. Use 0 (normal), 1 (high), or 2 (critical)` }] };
+        }
+
+        const priorityLabels = ['normal', 'high', 'critical'];
+        const result = db.prepare(`UPDATE ${table} SET priority = ? WHERE id = ?`).run(priority, args.id);
+        return {
+          content: [{
+            type: "text",
+            text: result.changes > 0
+              ? `Set ${args.type} #${args.id} priority to ${priorityLabels[priority]} (${priority})`
               : `No ${args.type} found with ID ${args.id}`
           }]
         };
