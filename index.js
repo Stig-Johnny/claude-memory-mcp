@@ -287,7 +287,7 @@ const getAllSessionsForProject = db.prepare(
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.3.0",
+    version: "2.4.0",
   },
   {
     capabilities: {
@@ -523,6 +523,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name" },
+          },
+          required: ["project"],
+        },
+      },
+      {
+        name: "load_comprehensive_memory",
+        description: "Load comprehensive memory for a project with higher limits - use this for thorough session starts. Returns 30 decisions, 50 learnings, 15 errors, all context, and all sessions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project: { type: "string", description: "Project name" },
+            include_global: { type: "boolean", description: "Also load global context (default: true)" },
           },
           required: ["project"],
         },
@@ -952,6 +964,111 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         output.push(`## 📊 Stats`);
         output.push(`Decisions: ${stats.decisions} | Errors: ${stats.errors} | Learnings: ${stats.learnings} | Context: ${stats.context}`);
+
+        return { content: [{ type: "text", text: output.join('\n') }] };
+      }
+
+      case "load_comprehensive_memory": {
+        // Load comprehensive memory with higher limits for thorough session starts
+        const includeGlobal = args.include_global !== false;
+
+        // Higher limits for comprehensive loading
+        const DECISION_LIMIT = 30;
+        const LEARNING_LIMIT = 50;
+        const ERROR_LIMIT = 15;
+
+        const sessions = getAllSessionsForProject.all(args.project);
+        const contextItems = getContext.all(args.project);
+        const decisions = getDecisions.all(args.project, DECISION_LIMIT);
+        const learnings = getLearnings.all(args.project, LEARNING_LIMIT);
+        const errors = getRecentErrors.all(args.project, ERROR_LIMIT);
+
+        // Get global context and learnings if requested
+        let globalContext = [];
+        let globalLearnings = [];
+        if (includeGlobal) {
+          globalContext = getContext.all('global');
+          globalLearnings = db.prepare(
+            "SELECT * FROM learnings WHERE project IS NULL AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT 20"
+          ).all();
+        }
+
+        let output = [`# Comprehensive Memory for ${args.project}\n`];
+        output.push(`_Loaded with higher limits: ${DECISION_LIMIT} decisions, ${LEARNING_LIMIT} learnings, ${ERROR_LIMIT} errors_\n`);
+
+        // Global context (if included)
+        if (includeGlobal && globalContext.length > 0) {
+          output.push(`## 🌐 Global Context`);
+          globalContext.forEach(c => output.push(`- **${c.key}:** ${c.value}`));
+          output.push('');
+        }
+
+        // Session status (show all workspace sessions)
+        if (sessions.length > 0) {
+          output.push(`## 📋 Active Sessions (${sessions.length})`);
+          for (const session of sessions) {
+            const timeAgo = getTimeAgo(session.updated_at);
+            const workspaceLabel = session.workspace ? `[${session.workspace}]` : '[default]';
+            output.push(`### ${workspaceLabel} (${timeAgo})`);
+            output.push(`**Task:** ${session.task}`);
+            output.push(`**Status:** ${session.status || 'in-progress'}`);
+            if (session.notes) output.push(`**Notes:** ${session.notes}`);
+            output.push('');
+          }
+        }
+
+        // Project context
+        if (contextItems.length > 0) {
+          output.push(`## ⚙️ Project Context (${contextItems.length} items)`);
+          contextItems.forEach(c => output.push(`- **${c.key}:** ${c.value}`));
+          output.push('');
+        }
+
+        // Decisions (with dates and rationales)
+        if (decisions.length > 0) {
+          output.push(`## 🎯 Decisions (${decisions.length})`);
+          decisions.forEach(d => {
+            output.push(`- **[${d.date}]** ${d.decision}`);
+            if (d.rationale) output.push(`  _Rationale: ${d.rationale}_`);
+          });
+          output.push('');
+        }
+
+        // Learnings (project + global combined, deduplicated)
+        const allLearnings = [...learnings];
+        if (includeGlobal) {
+          globalLearnings.forEach(g => {
+            if (!allLearnings.find(l => l.id === g.id)) {
+              allLearnings.push(g);
+            }
+          });
+        }
+        if (allLearnings.length > 0) {
+          output.push(`## 💡 Learnings (${allLearnings.length})`);
+          allLearnings.forEach(l => output.push(`- [${l.category}] ${l.content}${l.project ? '' : ' _(global)_'}`));
+          output.push('');
+        }
+
+        // Error solutions
+        if (errors.length > 0) {
+          output.push(`## 🐛 Error Solutions (${errors.length})`);
+          errors.forEach(e => {
+            output.push(`- **${e.error_pattern}**`);
+            output.push(`  Solution: ${e.solution}`);
+            if (e.context) output.push(`  Context: ${e.context}`);
+          });
+          output.push('');
+        }
+
+        // Summary stats
+        const stats = {
+          decisions: db.prepare("SELECT COUNT(*) as count FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          errors: db.prepare("SELECT COUNT(*) as count FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          learnings: db.prepare("SELECT COUNT(*) as count FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          context: contextItems.length,
+        };
+        output.push(`## 📊 Total Available`);
+        output.push(`Decisions: ${stats.decisions} (loaded: ${decisions.length}) | Errors: ${stats.errors} (loaded: ${errors.length}) | Learnings: ${stats.learnings} (loaded: ${allLearnings.length}) | Context: ${stats.context}`);
 
         return { content: [{ type: "text", text: output.join('\n') }] };
       }
