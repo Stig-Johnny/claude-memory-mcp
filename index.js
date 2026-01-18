@@ -197,6 +197,15 @@ try {
   db.exec(`ALTER TABLE learnings ADD COLUMN priority INTEGER DEFAULT 0`);
 } catch (e) { /* column already exists */ }
 
+// Add category column to decisions and errors (migration v2.6.0)
+// Categories help organize and filter memory items
+try {
+  db.exec(`ALTER TABLE decisions ADD COLUMN category TEXT`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE errors ADD COLUMN category TEXT`);
+} catch (e) { /* column already exists */ }
+
 // Migration for multi-workspace support: add workspace column and update unique constraint
 try {
   // Check if workspace column exists
@@ -238,20 +247,26 @@ try {
 
 // Prepared statements
 const insertDecision = db.prepare(
-  "INSERT INTO decisions (project, date, decision, rationale) VALUES (?, ?, ?, ?)"
+  "INSERT INTO decisions (project, date, decision, rationale, category) VALUES (?, ?, ?, ?, ?)"
 );
 const getDecisions = db.prepare(
   "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, date DESC LIMIT ?"
+);
+const getDecisionsByCategory = db.prepare(
+  "SELECT * FROM decisions WHERE project = ? AND category = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, date DESC LIMIT ?"
 );
 const searchDecisions = db.prepare(
   "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) AND (decision LIKE ? OR rationale LIKE ?) ORDER BY priority DESC, date DESC"
 );
 
 const insertError = db.prepare(
-  "INSERT INTO errors (project, error_pattern, solution, context) VALUES (?, ?, ?, ?)"
+  "INSERT INTO errors (project, error_pattern, solution, context, category) VALUES (?, ?, ?, ?, ?)"
 );
 const findSolution = db.prepare(
   "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) AND error_pattern LIKE ? ORDER BY priority DESC, created_at DESC LIMIT 5"
+);
+const findSolutionByCategory = db.prepare(
+  "SELECT * FROM errors WHERE project = ? AND category = ? AND (archived IS NULL OR archived = 0) AND error_pattern LIKE ? ORDER BY priority DESC, created_at DESC LIMIT 5"
 );
 const getRecentErrors = db.prepare(
   "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, created_at DESC LIMIT ?"
@@ -299,7 +314,7 @@ const getAllSessionsForProject = db.prepare(
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.5.0",
+    version: "2.6.0",
   },
   {
     capabilities: {
@@ -347,6 +362,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             decision: { type: "string", description: "What was decided" },
             rationale: { type: "string", description: "Why this decision was made" },
             date: { type: "string", description: "Date of decision (YYYY-MM-DD), defaults to today" },
+            category: { type: "string", description: "Category (e.g., 'architecture', 'security', 'api', 'ui', 'devops')" },
           },
           required: ["project", "decision"],
         },
@@ -359,6 +375,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             project: { type: "string", description: "Project name" },
             search: { type: "string", description: "Optional search term" },
+            category: { type: "string", description: "Filter by category (e.g., 'architecture', 'security')" },
             limit: { type: "number", description: "Max results (default 10)" },
           },
           required: ["project"],
@@ -386,6 +403,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             error_pattern: { type: "string", description: "Error message or pattern to match" },
             solution: { type: "string", description: "How the error was fixed" },
             context: { type: "string", description: "Additional context about when this occurs" },
+            category: { type: "string", description: "Category (e.g., 'build', 'runtime', 'api', 'database', 'auth')" },
           },
           required: ["project", "error_pattern", "solution"],
         },
@@ -398,6 +416,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             project: { type: "string", description: "Project name" },
             error: { type: "string", description: "Error message to search for" },
+            category: { type: "string", description: "Filter by category (e.g., 'build', 'runtime', 'api')" },
           },
           required: ["project", "error"],
         },
@@ -649,7 +668,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "remember_decision": {
         const date = args.date || new Date().toISOString().split("T")[0];
-        const result = insertDecision.run(args.project, date, args.decision, args.rationale || null);
+        const result = insertDecision.run(args.project, date, args.decision, args.rationale || null, args.category || null);
 
         // Sync to cloud if enabled
         if (firestoreSync) {
@@ -659,15 +678,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             date,
             decision: args.decision,
             rationale: args.rationale,
+            category: args.category,
           });
         }
 
-        return { content: [{ type: "text", text: `Decision stored for ${args.project}${firestoreSync ? ' (synced)' : ''}` }] };
+        const categoryText = args.category ? ` [${args.category}]` : '';
+        return { content: [{ type: "text", text: `Decision stored for ${args.project}${categoryText}${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "recall_decisions": {
         let results;
-        if (args.search) {
+        if (args.category) {
+          results = getDecisionsByCategory.all(args.project, args.category, args.limit || 10);
+        } else if (args.search) {
           const pattern = `%${args.search}%`;
           results = searchDecisions.all(args.project, pattern, pattern);
         } else {
@@ -677,7 +700,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: results.length > 0
-              ? results.map(r => `[${r.date}] ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`).join("\n\n")
+              ? results.map(r => {
+                  const categoryTag = r.category ? ` [${r.category}]` : '';
+                  return `[${r.date}]${categoryTag} ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`;
+                }).join("\n\n")
               : "No decisions found for this project"
           }]
         };
@@ -689,14 +715,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: results.length > 0
-              ? results.map(r => `[ID:${r.id}] [${r.date}] ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`).join("\n\n")
+              ? results.map(r => {
+                  const categoryTag = r.category ? ` [${r.category}]` : '';
+                  return `[ID:${r.id}] [${r.date}]${categoryTag} ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`;
+                }).join("\n\n")
               : "No decisions found for this project"
           }]
         };
       }
 
       case "remember_error": {
-        const result = insertError.run(args.project, args.error_pattern, args.solution, args.context || null);
+        const result = insertError.run(args.project, args.error_pattern, args.solution, args.context || null, args.category || null);
 
         if (firestoreSync) {
           await firestoreSync.syncToCloud("errors", {
@@ -705,20 +734,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             error_pattern: args.error_pattern,
             solution: args.solution,
             context: args.context,
+            category: args.category,
           });
         }
 
-        return { content: [{ type: "text", text: `Error solution stored for ${args.project}${firestoreSync ? ' (synced)' : ''}` }] };
+        const categoryText = args.category ? ` [${args.category}]` : '';
+        return { content: [{ type: "text", text: `Error solution stored for ${args.project}${categoryText}${firestoreSync ? ' (synced)' : ''}` }] };
       }
 
       case "find_solution": {
         const pattern = `%${args.error}%`;
-        const results = findSolution.all(args.project, pattern);
+        let results;
+        if (args.category) {
+          results = findSolutionByCategory.all(args.project, args.category, pattern);
+        } else {
+          results = findSolution.all(args.project, pattern);
+        }
         return {
           content: [{
             type: "text",
             text: results.length > 0
-              ? results.map(r => `Error: ${r.error_pattern}\nSolution: ${r.solution}\nContext: ${r.context || 'N/A'}`).join("\n\n---\n\n")
+              ? results.map(r => {
+                  const categoryTag = r.category ? ` [${r.category}]` : '';
+                  return `Error:${categoryTag} ${r.error_pattern}\nSolution: ${r.solution}\nContext: ${r.context || 'N/A'}`;
+                }).join("\n\n---\n\n")
               : "No matching solutions found"
           }]
         };
@@ -812,7 +851,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: results.length > 0
-              ? results.map(r => `[ID:${r.id}] ${r.error_pattern}\n  Solution: ${r.solution}\n  Context: ${r.context || 'N/A'}`).join("\n\n")
+              ? results.map(r => {
+                  const categoryTag = r.category ? ` [${r.category}]` : '';
+                  return `[ID:${r.id}]${categoryTag} ${r.error_pattern}\n  Solution: ${r.solution}\n  Context: ${r.context || 'N/A'}`;
+                }).join("\n\n")
               : "No errors stored for this project"
           }]
         };
@@ -1057,7 +1099,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const highPriorityCount = decisions.filter(d => (d.priority || 0) > 0).length;
           output.push(`## 🎯 Decisions (${decisions.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
           decisions.forEach(d => {
-            output.push(`- ${priorityIcon(d.priority)}**[${d.date}]** ${d.decision}`);
+            const categoryTag = d.category ? `[${d.category}] ` : '';
+            output.push(`- ${priorityIcon(d.priority)}**[${d.date}]** ${categoryTag}${d.decision}`);
             if (d.rationale) output.push(`  _Rationale: ${d.rationale}_`);
           });
           output.push('');
@@ -1084,7 +1127,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const highPriorityCount = errors.filter(e => (e.priority || 0) > 0).length;
           output.push(`## 🐛 Error Solutions (${errors.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
           errors.forEach(e => {
-            output.push(`- ${priorityIcon(e.priority)}**${e.error_pattern}**`);
+            const categoryTag = e.category ? `[${e.category}] ` : '';
+            output.push(`- ${priorityIcon(e.priority)}${categoryTag}**${e.error_pattern}**`);
             output.push(`  Solution: ${e.solution}`);
             if (e.context) output.push(`  Context: ${e.context}`);
           });
