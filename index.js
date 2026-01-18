@@ -206,6 +206,27 @@ try {
   db.exec(`ALTER TABLE errors ADD COLUMN category TEXT`);
 } catch (e) { /* column already exists */ }
 
+// Add usage tracking for memory tiers (migration v2.7.0)
+// Tracks access patterns to identify hot/warm/cold memory items
+try {
+  db.exec(`ALTER TABLE decisions ADD COLUMN access_count INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE decisions ADD COLUMN last_accessed TEXT`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE errors ADD COLUMN access_count INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE errors ADD COLUMN last_accessed TEXT`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE learnings ADD COLUMN access_count INTEGER DEFAULT 0`);
+} catch (e) { /* column already exists */ }
+try {
+  db.exec(`ALTER TABLE learnings ADD COLUMN last_accessed TEXT`);
+} catch (e) { /* column already exists */ }
+
 // Migration for multi-workspace support: add workspace column and update unique constraint
 try {
   // Check if workspace column exists
@@ -310,11 +331,22 @@ const getAllSessionsForProject = db.prepare(
   "SELECT * FROM sessions WHERE project = ? ORDER BY updated_at DESC"
 );
 
+// Access tracking for memory tiers (v2.7.0)
+const trackDecisionAccess = db.prepare(
+  "UPDATE decisions SET access_count = COALESCE(access_count, 0) + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = ?"
+);
+const trackErrorAccess = db.prepare(
+  "UPDATE errors SET access_count = COALESCE(access_count, 0) + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = ?"
+);
+const trackLearningAccess = db.prepare(
+  "UPDATE learnings SET access_count = COALESCE(access_count, 0) + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = ?"
+);
+
 // Create MCP server
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.6.0",
+    version: "2.7.0",
   },
   {
     capabilities: {
@@ -696,6 +728,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           results = getDecisions.all(args.project, args.limit || 10);
         }
+        // Track access for memory tiers
+        results.forEach(r => trackDecisionAccess.run(r.id));
         return {
           content: [{
             type: "text",
@@ -750,6 +784,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           results = findSolution.all(args.project, pattern);
         }
+        // Track access for memory tiers
+        results.forEach(r => trackErrorAccess.run(r.id));
         return {
           content: [{
             type: "text",
@@ -823,6 +859,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           results = getLearnings.all(args.project, args.limit || 20);
         }
+        // Track access for memory tiers
+        results.forEach(r => trackLearningAccess.run(r.id));
         return {
           content: [{
             type: "text",
@@ -1094,13 +1132,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Helper for priority indicator
         const priorityIcon = (p) => p === 2 ? '🔴 ' : p === 1 ? '🟡 ' : '';
 
+        // Helper for memory tier classification (v2.7.0)
+        const getTier = (item) => {
+          const accessCount = item.access_count || 0;
+          const lastAccessed = item.last_accessed ? new Date(item.last_accessed) : null;
+          const now = new Date();
+          const daysSinceAccess = lastAccessed ? (now - lastAccessed) / (1000 * 60 * 60 * 24) : Infinity;
+
+          // Hot: frequently accessed (5+) or recently accessed (7 days)
+          if (accessCount >= 5 || daysSinceAccess <= 7) return 'hot';
+          // Warm: moderately accessed (2+) or accessed within 30 days
+          if (accessCount >= 2 || daysSinceAccess <= 30) return 'warm';
+          // Cold: rarely or never accessed
+          return 'cold';
+        };
+        const tierIcon = (tier) => tier === 'hot' ? '🔥' : tier === 'warm' ? '⭐' : '';
+
         // Decisions (with dates and rationales)
         if (decisions.length > 0) {
           const highPriorityCount = decisions.filter(d => (d.priority || 0) > 0).length;
-          output.push(`## 🎯 Decisions (${decisions.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
+          const hotCount = decisions.filter(d => getTier(d) === 'hot').length;
+          output.push(`## 🎯 Decisions (${decisions.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
           decisions.forEach(d => {
             const categoryTag = d.category ? `[${d.category}] ` : '';
-            output.push(`- ${priorityIcon(d.priority)}**[${d.date}]** ${categoryTag}${d.decision}`);
+            const tier = tierIcon(getTier(d));
+            output.push(`- ${priorityIcon(d.priority)}${tier}**[${d.date}]** ${categoryTag}${d.decision}`);
             if (d.rationale) output.push(`  _Rationale: ${d.rationale}_`);
           });
           output.push('');
@@ -1117,18 +1173,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         if (allLearnings.length > 0) {
           const highPriorityCount = allLearnings.filter(l => (l.priority || 0) > 0).length;
-          output.push(`## 💡 Learnings (${allLearnings.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
-          allLearnings.forEach(l => output.push(`- ${priorityIcon(l.priority)}[${l.category}] ${l.content}${l.project ? '' : ' _(global)_'}`));
+          const hotCount = allLearnings.filter(l => getTier(l) === 'hot').length;
+          output.push(`## 💡 Learnings (${allLearnings.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
+          allLearnings.forEach(l => {
+            const tier = tierIcon(getTier(l));
+            output.push(`- ${priorityIcon(l.priority)}${tier}[${l.category}] ${l.content}${l.project ? '' : ' _(global)_'}`);
+          });
           output.push('');
         }
 
         // Error solutions
         if (errors.length > 0) {
           const highPriorityCount = errors.filter(e => (e.priority || 0) > 0).length;
-          output.push(`## 🐛 Error Solutions (${errors.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''})`);
+          const hotCount = errors.filter(e => getTier(e) === 'hot').length;
+          output.push(`## 🐛 Error Solutions (${errors.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
           errors.forEach(e => {
             const categoryTag = e.category ? `[${e.category}] ` : '';
-            output.push(`- ${priorityIcon(e.priority)}${categoryTag}**${e.error_pattern}**`);
+            const tier = tierIcon(getTier(e));
+            output.push(`- ${priorityIcon(e.priority)}${tier}${categoryTag}**${e.error_pattern}**`);
             output.push(`  Solution: ${e.solution}`);
             if (e.context) output.push(`  Context: ${e.context}`);
           });
